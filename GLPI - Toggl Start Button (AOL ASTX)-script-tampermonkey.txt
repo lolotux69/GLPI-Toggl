@@ -1,0 +1,916 @@
+// ==UserScript==
+// @name         GLPI -> Toggl Start Button (AOL ASTX)
+// @namespace    https://support-opensource.axess.fr/
+// @version      0.1.0
+// @description  Ajoute un bouton Start Toggl sur les tickets GLPI et démarre un timer Toggl sur le bon projet client.
+// @match        https://support-opensource.axess.fr/front/ticket.form.php*
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_registerMenuCommand
+// @grant        GM_xmlhttpRequest
+// @connect      api.track.toggl.com
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const CFG = {
+    togglApiBase: 'https://api.track.toggl.com/api/v9',
+    togglTimerUrl: 'https://track.toggl.com/timer',
+    workspaceName: 'AOL (ASTX)',
+    buttonId: 'tm-start-toggl-btn',
+    tokenKey: 'toggl_api_token',
+    workspaceCacheKey: 'toggl_workspace_id_cache',
+    clientMemoryKey: 'glpi_toggl_client_project_memory_v1',
+    createdWith: 'Tampermonkey GLPI -> Toggl',
+    maxProjectsPerPage: 200,
+    maxManualResults: 50,
+  };
+
+  // ----------------------------
+  // Tampermonkey menu
+  // ----------------------------
+
+  GM_registerMenuCommand('Configurer le token Toggl', async () => {
+    const current = GM_getValue(CFG.tokenKey, '');
+    const entered = window.prompt(
+      'Colle ici ton API token Toggl Track.\nIl sera stocké côté Tampermonkey.',
+      current || ''
+    );
+    if (entered === null) return;
+    const token = entered.trim();
+    if (!token) {
+      alert('Token vide, rien de changé.');
+      return;
+    }
+    GM_setValue(CFG.tokenKey, token);
+    toast('Token Toggl enregistré.');
+  });
+
+  GM_registerMenuCommand('Effacer le token Toggl', () => {
+    if (!GM_getValue(CFG.tokenKey, '')) {
+      alert('Aucun token enregistré.');
+      return;
+    }
+    if (confirm('Effacer le token Toggl stocké dans Tampermonkey ?')) {
+      GM_deleteValue(CFG.tokenKey);
+      toast('Token Toggl effacé.');
+    }
+  });
+
+  GM_registerMenuCommand('Effacer la mémoire client -> projet', () => {
+    if (confirm('Effacer la mémoire des projets mémorisés par client ?')) {
+      GM_deleteValue(CFG.clientMemoryKey);
+      toast('Mémoire client/projet effacée.');
+    }
+  });
+
+  // ----------------------------
+  // Helpers généraux
+  // ----------------------------
+
+  function cleanText(str) {
+    return String(str || '')
+      .replace(/\s+/g, ' ')
+      .replace(/\u00a0/g, ' ')
+      .trim();
+  }
+
+  function normalizeLoose(str) {
+    return cleanText(str)
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toUpperCase();
+  }
+
+  function normalizeClientName(str) {
+    return normalizeLoose(str).replace(/\s+/g, ' ').trim();
+  }
+
+  function stripTrailingEntityCode(entity) {
+    return cleanText(entity).replace(/\s+\d{4,}\s*$/, '').trim();
+  }
+
+  function getTicketIdFromUrl() {
+    const url = new URL(window.location.href);
+    return cleanText(url.searchParams.get('id'));
+  }
+
+  function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function debounce(fn, wait = 250) {
+    let timer = null;
+    return (...args) => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => fn(...args), wait);
+    };
+  }
+
+  function objectWithoutNulls(obj) {
+    return Object.fromEntries(
+      Object.entries(obj).filter(([, value]) => value !== undefined && value !== null)
+    );
+  }
+
+  function getClientMemory() {
+    return GM_getValue(CFG.clientMemoryKey, {});
+  }
+
+  function setClientMemory(clientKey, project) {
+    const memory = getClientMemory();
+    memory[clientKey] = {
+      projectId: project.id,
+      projectName: project.name,
+      clientName: project.client_name || '',
+      savedAt: new Date().toISOString(),
+    };
+    GM_setValue(CFG.clientMemoryKey, memory);
+  }
+
+  function getRememberedProjectId(clientKey) {
+    const memory = getClientMemory();
+    return memory?.[clientKey]?.projectId || null;
+  }
+
+  function toast(message, isError = false) {
+    let box = document.getElementById('tm-toggl-toast');
+    if (!box) {
+      box = document.createElement('div');
+      box.id = 'tm-toggl-toast';
+      Object.assign(box.style, {
+        position: 'fixed',
+        top: '18px',
+        right: '18px',
+        zIndex: '999999',
+        background: isError ? '#8b1e1e' : '#1f2937',
+        color: '#fff',
+        padding: '10px 14px',
+        borderRadius: '8px',
+        boxShadow: '0 6px 18px rgba(0,0,0,0.25)',
+        fontSize: '13px',
+        maxWidth: '420px',
+      });
+      document.body.appendChild(box);
+    }
+    box.textContent = message;
+    box.style.background = isError ? '#8b1e1e' : '#1f2937';
+    box.style.display = 'block';
+    clearTimeout(box._hideTimer);
+    box._hideTimer = setTimeout(() => {
+      box.style.display = 'none';
+    }, 4500);
+  }
+
+  function parseJsonSafe(text) {
+    if (!text) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return text;
+    }
+  }
+
+  // ----------------------------
+  // API Toggl
+  // ----------------------------
+
+  async function getOrPromptToken() {
+    let token = GM_getValue(CFG.tokenKey, '');
+    if (token) return token;
+
+    const entered = window.prompt(
+      'Premier lancement : colle ton API token Toggl Track.\nIl sera stocké dans Tampermonkey.'
+    );
+    if (!entered) throw new Error('Aucun token Toggl fourni.');
+    token = entered.trim();
+    if (!token) throw new Error('Token Toggl vide.');
+    GM_setValue(CFG.tokenKey, token);
+    return token;
+  }
+
+  function gmRequest(details) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        timeout: 30000,
+        ...details,
+        onload: resolve,
+        onerror: reject,
+        ontimeout: reject,
+      });
+    });
+  }
+
+  async function togglRequest(method, path, body = null, query = null) {
+    const token = await getOrPromptToken();
+    const url = new URL(`${CFG.togglApiBase}${path}`);
+
+    if (query) {
+      for (const [key, value] of Object.entries(query)) {
+        if (value === undefined || value === null || value === '') continue;
+        url.searchParams.append(key, String(value));
+      }
+    }
+
+    const auth = btoa(`${token}:api_token`);
+    const response = await gmRequest({
+      method,
+      url: url.toString(),
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Basic ${auth}`,
+      },
+      data: body ? JSON.stringify(body) : undefined,
+    });
+
+    const payload = parseJsonSafe(response.responseText);
+
+    if (response.status >= 200 && response.status < 300) {
+      return payload;
+    }
+
+    let message = `Erreur Toggl ${response.status}`;
+    if (payload && typeof payload === 'object') {
+      message += ` : ${payload.message || payload.error || JSON.stringify(payload)}`;
+    } else if (typeof payload === 'string' && payload.trim()) {
+      message += ` : ${payload.trim()}`;
+    }
+
+    throw new Error(message);
+  }
+
+  async function getWorkspaceIdByName() {
+    const cached = GM_getValue(CFG.workspaceCacheKey, null);
+    if (cached) return cached;
+
+    const result = await togglRequest('GET', '/workspaces');
+    const workspaces = Array.isArray(result) ? result : (result?.items || []);
+
+    const found = workspaces.find(ws => cleanText(ws.name) === CFG.workspaceName);
+    if (!found) {
+      throw new Error(`Workspace Toggl introuvable : "${CFG.workspaceName}"`);
+    }
+
+    GM_setValue(CFG.workspaceCacheKey, found.id);
+    return found.id;
+  }
+
+  async function getAllActiveProjects(workspaceId) {
+    let page = 1;
+    const all = [];
+    const seen = new Set();
+
+    while (page < 100) {
+      const result = await togglRequest(
+        'GET',
+        `/workspaces/${workspaceId}/projects`,
+        null,
+        {
+          active: true,
+          page,
+          per_page: CFG.maxProjectsPerPage,
+          sort_field: 'name',
+          sort_order: 'ASC',
+        }
+      );
+
+      const items = Array.isArray(result) ? result : (result?.items || []);
+      if (!items.length) break;
+
+      for (const project of items) {
+        if (!seen.has(project.id)) {
+          seen.add(project.id);
+          all.push(project);
+        }
+      }
+
+      if (items.length < CFG.maxProjectsPerPage) break;
+      page += 1;
+    }
+
+    return all.filter(p => p.active !== false);
+  }
+
+  async function getCurrentRunningEntry() {
+    return await togglRequest('GET', '/me/time_entries/current');
+  }
+
+  async function stopCurrentRunningEntryIfAny() {
+    const current = await getCurrentRunningEntry();
+    if (!current || !current.id) return null;
+
+    const now = new Date();
+    const workspaceId = current.workspace_id || current.wid;
+    if (!workspaceId) {
+      throw new Error('Timer courant trouvé, mais workspace_id absent.');
+    }
+
+    let durationSeconds = 0;
+
+    if (current.start) {
+      const startTs = Date.parse(current.start);
+      durationSeconds = Math.max(0, Math.floor((Date.now() - startTs) / 1000));
+    } else if (typeof current.duration === 'number' && current.duration < 0) {
+      durationSeconds = Math.max(0, Math.floor(Date.now() / 1000) + current.duration);
+    }
+
+    const body = objectWithoutNulls({
+      workspace_id: workspaceId,
+      description: current.description ?? '',
+      project_id: current.project_id ?? current.pid ?? undefined,
+      task_id: current.task_id ?? current.tid ?? undefined,
+      billable: typeof current.billable === 'boolean' ? current.billable : undefined,
+      start: current.start,
+      stop: now.toISOString(),
+      duration: durationSeconds,
+    });
+
+    await togglRequest(
+      'PUT',
+      `/workspaces/${workspaceId}/time_entries/${current.id}`,
+      body
+    );
+
+    return current;
+  }
+
+  async function startTimeEntry(workspaceId, projectId, description) {
+    const body = {
+      workspace_id: workspaceId,
+      project_id: projectId,
+      description,
+      billable: true,
+      created_with: CFG.createdWith,
+      start: new Date().toISOString(),
+      duration: -1,
+    };
+
+    return await togglRequest(
+      'POST',
+      `/workspaces/${workspaceId}/time_entries`,
+      body
+    );
+  }
+
+  // ----------------------------
+  // Extraction GLPI
+  // ----------------------------
+
+function findTicketTitleElement() {
+  const selectors = [
+    'h3.navigationheader-title',
+    'h3.navigationheader-title.strong',
+    '.navigationheader-title',
+    'main h3',
+    'main h2',
+    '.page-header h3',
+    '.page-header h2',
+    '.content-header h3',
+    '.content-header h2',
+    '.card .card-title',
+    'h3',
+    'h2',
+  ];
+
+  for (const selector of selectors) {
+    const candidates = Array.from(document.querySelectorAll(selector));
+    for (const el of candidates) {
+      const txt = cleanText(el.textContent);
+      if (!txt) continue;
+      if (!/\(\d{6,}\)/.test(txt) && !/ticket/i.test(txt)) continue;
+      if (el.querySelector(`#${CFG.buttonId}`)) continue;
+      return el;
+    }
+  }
+  return null;
+}
+
+  function getTicketTitle() {
+    const titleEl = findTicketTitleElement();
+    if (titleEl) {
+      const cloned = titleEl.cloneNode(true);
+      const btn = cloned.querySelector(`#${CFG.buttonId}`);
+      if (btn) btn.remove();
+      const txt = cleanText(cloned.textContent).replace(/\s*Start Toggl\s*/i, '').trim();
+      if (txt) return txt;
+    }
+
+    const rawTitle = document.title || '';
+    return cleanText(rawTitle.replace(/\s*-\s*GLPI.*$/i, ''));
+  }
+
+  function findLabeledValue(labelWanted) {
+    const wanted = normalizeLoose(labelWanted);
+
+    const candidates = Array.from(
+      document.querySelectorAll('th, td, dt, label, strong, b, span, div')
+    );
+
+    for (const el of candidates) {
+      const text = cleanText(el.textContent);
+      if (!text || normalizeLoose(text) !== wanted) continue;
+
+      const row = el.closest('tr');
+      if (row) {
+        const cells = Array.from(row.children);
+        const idx = cells.indexOf(el);
+        if (idx >= 0 && cells[idx + 1]) {
+          const val = cleanText(cells[idx + 1].textContent);
+          if (val) return val;
+        }
+      }
+
+      if (el.tagName === 'DT' && el.nextElementSibling) {
+        const val = cleanText(el.nextElementSibling.textContent);
+        if (val) return val;
+      }
+
+      let sibling = el.nextElementSibling;
+      while (sibling) {
+        const val = cleanText(sibling.textContent);
+        if (val && normalizeLoose(val) !== wanted) return val;
+        sibling = sibling.nextElementSibling;
+      }
+
+      const parent = el.parentElement;
+      if (parent) {
+        const children = Array.from(parent.children)
+          .map(child => ({ el: child, txt: cleanText(child.textContent) }))
+          .filter(x => x.txt);
+
+        if (children.length >= 2) {
+          const idx = children.findIndex(x => x.el === el);
+          if (idx >= 0 && children[idx + 1]) {
+            const val = children[idx + 1].txt;
+            if (val && normalizeLoose(val) !== wanted) return val;
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function extractTicketContext() {
+    const ticketId = getTicketIdFromUrl();
+    if (!ticketId) {
+      throw new Error('Impossible de lire l’ID du ticket depuis l’URL.');
+    }
+
+    const ticketTitle = getTicketTitle();
+    if (!ticketTitle) {
+      throw new Error('Impossible de lire le titre du ticket.');
+    }
+
+    const rawEntity = findLabeledValue('Entité');
+    if (!rawEntity) {
+      throw new Error('Impossible de lire le champ "Entité" sur la page GLPI.');
+    }
+
+    const clientRaw = stripTrailingEntityCode(rawEntity);
+    if (!clientRaw) {
+      throw new Error(`Champ Entité lu, mais client vide après nettoyage : "${rawEntity}"`);
+    }
+
+    const clientNormalized = normalizeClientName(clientRaw);
+    const description = ticketTitle.includes(`(${ticketId})`)
+  ? ticketTitle
+  : `${ticketTitle} (${ticketId})`;
+
+    return {
+      ticketId,
+      ticketTitle,
+      description,
+      rawEntity,
+      clientRaw,
+      clientNormalized,
+    };
+  }
+
+  // ----------------------------
+  // Popup de choix
+  // ----------------------------
+
+  function chooseProjectModal({ clientRaw, matchedProjects, allProjects }) {
+    return new Promise((resolve) => {
+      const overlay = document.createElement('div');
+      Object.assign(overlay.style, {
+        position: 'fixed',
+        inset: '0',
+        background: 'rgba(0,0,0,0.45)',
+        zIndex: '999998',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        padding: '20px',
+      });
+
+      const modal = document.createElement('div');
+      Object.assign(modal.style, {
+        width: 'min(920px, 96vw)',
+        maxHeight: '88vh',
+        overflow: 'hidden',
+        background: '#fff',
+        borderRadius: '12px',
+        boxShadow: '0 20px 50px rgba(0,0,0,0.3)',
+        display: 'flex',
+        flexDirection: 'column',
+      });
+
+      const header = document.createElement('div');
+      Object.assign(header.style, {
+        padding: '16px 18px',
+        borderBottom: '1px solid #e5e7eb',
+        display: 'flex',
+        justifyContent: 'space-between',
+        gap: '12px',
+        alignItems: 'center',
+      });
+
+      const title = document.createElement('div');
+      title.innerHTML = `
+        <div style="font-size:16px;font-weight:700;">Choix du projet Toggl</div>
+        <div style="font-size:12px;color:#4b5563;margin-top:4px;">
+          Client GLPI : <b>${escapeHtml(clientRaw)}</b>
+        </div>
+      `;
+
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = 'Fermer';
+      stylePlainButton(closeBtn);
+
+      header.appendChild(title);
+      header.appendChild(closeBtn);
+
+      const body = document.createElement('div');
+      Object.assign(body.style, {
+        padding: '16px 18px',
+        overflow: 'auto',
+      });
+
+      const topBar = document.createElement('div');
+      Object.assign(topBar.style, {
+        display: 'flex',
+        flexWrap: 'wrap',
+        gap: '10px',
+        marginBottom: '14px',
+        alignItems: 'center',
+      });
+
+      const info = document.createElement('div');
+      info.style.fontSize = '13px';
+      info.style.color = '#374151';
+
+      const manualBtn = document.createElement('button');
+      manualBtn.textContent = 'Recherche manuelle';
+      stylePlainButton(manualBtn);
+
+      const matchedBtn = document.createElement('button');
+      matchedBtn.textContent = 'Retour aux matches client';
+      stylePlainButton(matchedBtn);
+      matchedBtn.style.display = matchedProjects.length ? 'inline-block' : 'none';
+
+      const filterInput = document.createElement('input');
+      filterInput.type = 'text';
+      filterInput.placeholder = 'Recherche manuelle : BCAOL, OP, nom projet, client...';
+      Object.assign(filterInput.style, {
+        flex: '1 1 420px',
+        minWidth: '260px',
+        padding: '8px 10px',
+        border: '1px solid #cbd5e1',
+        borderRadius: '8px',
+        fontSize: '13px',
+      });
+
+      const directIdInput = document.createElement('input');
+      directIdInput.type = 'text';
+      directIdInput.placeholder = 'ID projet';
+      Object.assign(directIdInput.style, {
+        width: '130px',
+        padding: '8px 10px',
+        border: '1px solid #cbd5e1',
+        borderRadius: '8px',
+        fontSize: '13px',
+      });
+
+      const directIdBtn = document.createElement('button');
+      directIdBtn.textContent = 'Utiliser cet ID';
+      stylePrimaryButton(directIdBtn);
+
+      const openTogglBtn = document.createElement('button');
+      openTogglBtn.textContent = 'Ouvrir Toggl';
+      stylePlainButton(openTogglBtn);
+
+      topBar.append(info, manualBtn, matchedBtn, filterInput, directIdInput, directIdBtn, openTogglBtn);
+
+      const list = document.createElement('div');
+      Object.assign(list.style, {
+        display: 'grid',
+        gap: '8px',
+      });
+
+      body.appendChild(topBar);
+      body.appendChild(list);
+
+      modal.appendChild(header);
+      modal.appendChild(body);
+      overlay.appendChild(modal);
+      document.body.appendChild(overlay);
+
+      let mode = matchedProjects.length ? 'matched' : 'manual';
+
+      function cleanup(value = null) {
+        overlay.remove();
+        resolve(value);
+      }
+
+      function render() {
+        const filter = normalizeLoose(filterInput.value || '');
+        const pool = mode === 'matched'
+          ? matchedProjects
+          : allProjects.filter(project => {
+              if (!filter) return true;
+              const haystack = normalizeLoose(
+                `${project.name || ''} ${project.client_name || ''} ${project.id || ''}`
+              );
+              return haystack.includes(filter);
+            });
+
+        const results = pool.slice(0, CFG.maxManualResults);
+
+        info.textContent = mode === 'matched'
+          ? `${matchedProjects.length} projet(s) actif(s) trouvé(s) pour ce client`
+          : `${pool.length} projet(s) actif(s) correspondant(s) à la recherche manuelle`;
+
+        filterInput.style.display = mode === 'manual' ? 'inline-block' : 'none';
+        directIdInput.style.display = mode === 'manual' ? 'inline-block' : 'none';
+        directIdBtn.style.display = mode === 'manual' ? 'inline-block' : 'none';
+
+        list.innerHTML = '';
+
+        if (!results.length) {
+          const empty = document.createElement('div');
+          empty.textContent = mode === 'matched'
+            ? 'Aucun projet actif trouvé pour ce client.'
+            : 'Aucun projet correspondant à la recherche.';
+          Object.assign(empty.style, {
+            padding: '16px',
+            border: '1px dashed #cbd5e1',
+            borderRadius: '8px',
+            color: '#6b7280',
+            fontSize: '13px',
+          });
+          list.appendChild(empty);
+          return;
+        }
+
+        for (const project of results) {
+          const row = document.createElement('button');
+          row.type = 'button';
+          Object.assign(row.style, {
+            textAlign: 'left',
+            border: '1px solid #d1d5db',
+            background: '#fff',
+            borderRadius: '10px',
+            padding: '10px 12px',
+            cursor: 'pointer',
+          });
+
+          const clientLine = cleanText(project.client_name || '');
+          row.innerHTML = `
+            <div style="font-size:13px;font-weight:600;color:#111827;">
+              ${escapeHtml(project.name || `Projet ${project.id}`)}
+            </div>
+            <div style="font-size:11px;color:#6b7280;margin-top:4px;">
+              ID: ${escapeHtml(String(project.id))}
+              ${clientLine ? ` • Client: ${escapeHtml(clientLine)}` : ''}
+            </div>
+          `;
+
+          row.addEventListener('click', () => cleanup(project));
+          list.appendChild(row);
+        }
+      }
+
+      closeBtn.addEventListener('click', () => cleanup(null));
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) cleanup(null);
+      });
+
+      manualBtn.addEventListener('click', () => {
+        mode = 'manual';
+        render();
+        filterInput.focus();
+      });
+
+      matchedBtn.addEventListener('click', () => {
+        mode = 'matched';
+        render();
+      });
+
+      filterInput.addEventListener('input', render);
+
+      directIdBtn.addEventListener('click', () => {
+        const raw = cleanText(directIdInput.value);
+        if (!raw) {
+          alert('Entre un ID projet Toggl.');
+          return;
+        }
+        const project = allProjects.find(p => String(p.id) === raw);
+        if (!project) {
+          alert(`Aucun projet actif trouvé avec l’ID ${raw}.`);
+          return;
+        }
+        cleanup(project);
+      });
+
+      directIdInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') directIdBtn.click();
+      });
+
+      openTogglBtn.addEventListener('click', () => {
+        window.open(CFG.togglTimerUrl, '_blank', 'noopener');
+      });
+
+      document.addEventListener(
+        'keydown',
+        function onKey(e) {
+          if (e.key === 'Escape') {
+            document.removeEventListener('keydown', onKey);
+            cleanup(null);
+          }
+        },
+        { once: true }
+      );
+
+      render();
+    });
+  }
+
+  function stylePlainButton(btn) {
+    Object.assign(btn.style, {
+      padding: '8px 10px',
+      border: '1px solid #cbd5e1',
+      background: '#fff',
+      color: '#111827',
+      borderRadius: '8px',
+      cursor: 'pointer',
+      fontSize: '13px',
+    });
+  }
+
+  function stylePrimaryButton(btn) {
+    Object.assign(btn.style, {
+      padding: '8px 10px',
+      border: '1px solid #0f766e',
+      background: '#0f766e',
+      color: '#fff',
+      borderRadius: '8px',
+      cursor: 'pointer',
+      fontSize: '13px',
+    });
+  }
+
+  function escapeHtml(str) {
+    return String(str || '')
+      .replaceAll('&', '&amp;')
+      .replaceAll('<', '&lt;')
+      .replaceAll('>', '&gt;')
+      .replaceAll('"', '&quot;')
+      .replaceAll("'", '&#039;');
+  }
+
+  // ----------------------------
+  // Workflow principal
+  // ----------------------------
+
+  async function handleStartClick(button) {
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Start...';
+
+    try {
+      const ctx = extractTicketContext();
+      const workspaceId = await getWorkspaceIdByName();
+      const activeProjects = await getAllActiveProjects(workspaceId);
+
+      let chosenProject = null;
+
+      const rememberedProjectId = getRememberedProjectId(ctx.clientNormalized);
+      if (rememberedProjectId) {
+        const remembered = activeProjects.find(
+          p =>
+            String(p.id) === String(rememberedProjectId) &&
+            normalizeClientName(p.client_name || '') === ctx.clientNormalized
+        );
+        if (remembered) {
+          chosenProject = remembered;
+        }
+      }
+
+      if (!chosenProject) {
+        const matchedProjects = activeProjects.filter(
+          p => normalizeClientName(p.client_name || '') === ctx.clientNormalized
+        );
+
+        if (matchedProjects.length === 1) {
+          chosenProject = matchedProjects[0];
+        } else {
+          chosenProject = await chooseProjectModal({
+            clientRaw: ctx.clientRaw,
+            matchedProjects,
+            allProjects: activeProjects,
+          });
+        }
+      }
+
+      if (!chosenProject) {
+        toast('Aucun projet choisi.', true);
+        return;
+      }
+
+      button.textContent = 'Stop ancien timer...';
+      await stopCurrentRunningEntryIfAny();
+
+      button.textContent = 'Start nouveau timer...';
+      await startTimeEntry(workspaceId, chosenProject.id, ctx.description);
+
+      setClientMemory(ctx.clientNormalized, chosenProject);
+
+      toast(`Timer démarré sur : ${chosenProject.name}`);
+    } catch (err) {
+      console.error('[GLPI->Toggl]', err);
+      toast(err.message || String(err), true);
+      alert(`GLPI -> Toggl : ${err.message || String(err)}`);
+    } finally {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+
+  // ----------------------------
+  // Injection du bouton
+  // ----------------------------
+
+  function ensureButton() {
+    if (!/ticket\.form\.php/i.test(location.pathname)) return;
+    if (document.getElementById(CFG.buttonId)) return;
+
+    const titleEl = findTicketTitleElement();
+    if (!titleEl) return;
+
+    const btn = document.createElement('button');
+    btn.id = CFG.buttonId;
+    btn.type = 'button';
+    btn.textContent = 'Start Toggl';
+
+    Object.assign(btn.style, {
+      marginLeft: '12px',
+      padding: '8px 12px',
+      borderRadius: '8px',
+      border: '1px solid #0f766e',
+      background: '#0f766e',
+      color: '#fff',
+      cursor: 'pointer',
+      fontSize: '13px',
+      whiteSpace: 'nowrap',
+    });
+
+    btn.addEventListener('click', () => handleStartClick(btn));
+
+    const parent = titleEl.parentElement;
+    if (parent && getComputedStyle(parent).display.includes('flex')) {
+      btn.style.marginLeft = 'auto';
+      parent.appendChild(btn);
+    } else {
+      titleEl.insertAdjacentElement('afterend', btn);
+    }
+  }
+
+  // ----------------------------
+  // Boot
+  // ----------------------------
+
+  const boot = debounce(() => {
+    try {
+      ensureButton();
+    } catch (err) {
+      console.error('[GLPI->Toggl] boot error', err);
+    }
+  }, 200);
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+  } else {
+    boot();
+  }
+
+  const observer = new MutationObserver(boot);
+  observer.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+  });
+
+})();

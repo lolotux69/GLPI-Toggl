@@ -1,0 +1,688 @@
+## 1. En-tête Tampermonkey
+
+```js
+// ==UserScript==
+// @name ...
+// @match ...
+// @grant ...
+// @connect ...
+// ==/UserScript==
+```
+
+C’est la **carte d’identité** du script.
+
+À quoi ça sert :
+
+* `@name`, `@description`, `@version` : nom, résumé, version.
+* `@match` : dit sur **quelles pages** le script doit s’exécuter.
+  Ici : les pages ticket GLPI `ticket.form.php`.
+* `@grant` : autorisations Tampermonkey.
+
+  * `GM_getValue`, `GM_setValue`, `GM_deleteValue` : stocker le token et la mémoire client/projet.
+  * `GM_registerMenuCommand` : ajouter des actions dans le menu Tampermonkey.
+  * `GM_xmlhttpRequest` : faire des appels HTTP vers l’API Toggl.
+* `@connect api.track.toggl.com` : autorise explicitement les appels à l’API Toggl.
+
+---
+
+## 2. Bloc principal auto-exécuté
+
+```js
+(function () {
+  'use strict';
+  ...
+})();
+```
+
+C’est une **IIFE**.
+
+Rôle :
+
+* éviter de polluer l’espace global de la page ;
+* encapsuler toutes les fonctions et constantes ;
+* activer le mode strict pour réduire certaines erreurs JavaScript silencieuses.
+
+---
+
+## 3. Configuration centrale `CFG`
+
+```js
+const CFG = {
+  togglApiBase: ...,
+  togglTimerUrl: ...,
+  workspaceName: 'AOL (ASTX)',
+  ...
+};
+```
+
+C’est le **panneau de configuration**.
+
+Chaque champ sert à quelque chose :
+
+* `togglApiBase` : base URL de l’API Toggl v9.
+* `togglTimerUrl` : URL de l’interface Toggl.
+* `workspaceName` : nom du workspace fixe.
+* `buttonId`, `stopButtonId` : identifiants HTML des boutons injectés.
+* `tokenKey` : clé Tampermonkey pour stocker le token API.
+* `workspaceCacheKey` : clé de cache pour éviter de rechercher l’ID workspace à chaque fois.
+* `clientMemoryKey` : mémoire du dernier projet choisi pour un client.
+* `createdWith` : texte envoyé à Toggl pour identifier l’origine de la création.
+* `maxProjectsPerPage` : taille de pagination API.
+* `maxManualResults` : nombre max d’éléments affichés dans la popup.
+
+**Idée générale** : tout ce qui est variable est regroupé ici.
+
+---
+
+## 4. Menu Tampermonkey
+
+### a) Configurer le token
+
+```js
+GM_registerMenuCommand('Configurer le token Toggl', ...)
+```
+
+Ajoute une entrée dans le menu Tampermonkey pour :
+
+* afficher une popup,
+* saisir le token API,
+* le stocker localement.
+
+### b) Effacer le token
+
+```js
+GM_registerMenuCommand('Effacer le token Toggl', ...)
+```
+
+Permet de supprimer le token stocké.
+
+### c) Effacer la mémoire client → projet
+
+```js
+GM_registerMenuCommand('Effacer la mémoire client -> projet', ...)
+```
+
+Supprime l’historique local du type :
+
+* `METROPOLE DE LYON` → `projet Toggl X`
+
+C’est utile si :
+
+* un BCAOL a changé,
+* un mauvais projet a été mémorisé.
+
+---
+
+## 5. Helpers généraux
+
+Ce sont des **petites fonctions utilitaires**.
+
+### `cleanText(str)`
+
+Nettoie un texte :
+
+* remplace les espaces spéciaux,
+* compacte les espaces multiples,
+* trim.
+
+But : rendre les comparaisons plus robustes.
+
+### `normalizeLoose(str)`
+
+Normalise un texte pour comparer “souplement” :
+
+* enlève les accents,
+* met en majuscules,
+* nettoie les espaces.
+
+Exemple :
+
+* `Métropole de Lyon`
+* `METROPOLE   DE   LYON`
+* `metropole de lyon`
+
+deviennent quelque chose d’équivalent.
+
+### `normalizeClientName(str)`
+
+Version spécialisée pour les noms de client.
+
+### `stripTrailingEntityCode(entity)`
+
+Supprime le code final dans l’entité GLPI.
+
+Exemple :
+
+* `METROPOLE DE LYON 019636`
+  → `METROPOLE DE LYON`
+
+C’est **crucial** car ton matching client côté Toggl se fait sur cette forme.
+
+### `getTicketIdFromUrl()`
+
+Lit l’ID du ticket depuis l’URL :
+
+* `...?id=2026000613`
+  → `2026000613`
+
+### `debounce(fn, wait)`
+
+Évite d’exécuter une fonction trop souvent quand le DOM bouge beaucoup.
+
+Ici, ça sert à calmer le `MutationObserver`.
+
+### `objectWithoutNulls(obj)`
+
+Retire les champs `null` ou `undefined` avant envoi API.
+
+Utile pour éviter d’envoyer des données inutiles à Toggl.
+
+---
+
+## 6. Mémoire locale client → projet
+
+### `getClientMemory()`
+
+Lit la mémoire stockée par Tampermonkey.
+
+### `setClientMemory(clientKey, project)`
+
+Sauvegarde le dernier projet choisi pour un client.
+
+Exemple :
+
+* client normalisé : `METROPOLE DE LYON`
+* projet : `BCAOL/...`
+
+### `getRememberedProjectId(clientKey)`
+
+Retourne l’ID projet mémorisé pour ce client.
+
+**Effet pratique** :
+
+* si tu relances un ticket du même client,
+* le script peut démarrer directement le dernier projet utilisé,
+* sans te reposer la question.
+
+---
+
+## 7. Affichage de messages utilisateur
+
+### `toast(message, isError = false)`
+
+Affiche une petite notification en haut à droite :
+
+* fond sombre normal,
+* rouge si erreur.
+
+Elle sert à dire par exemple :
+
+* token enregistré,
+* timer démarré,
+* timer arrêté,
+* erreur API.
+
+### `parseJsonSafe(text)`
+
+Essaie de parser un JSON, sinon renvoie le texte brut.
+
+Très utile pour traiter proprement les réponses de l’API Toggl.
+
+---
+
+## 8. Appels API Toggl
+
+C’est le **moteur réseau** du script.
+
+### `getOrPromptToken()`
+
+* lit le token stocké ;
+* s’il n’existe pas, demande à l’utilisateur de le saisir ;
+* puis l’enregistre.
+
+### `gmRequest(details)`
+
+Enveloppe `GM_xmlhttpRequest` dans une Promise.
+
+Ça permet d’utiliser `await` plus proprement.
+
+### `togglRequest(method, path, body, query)`
+
+C’est la **fonction générique d’appel API**.
+
+Elle :
+
+* récupère le token ;
+* construit l’URL ;
+* ajoute les query params ;
+* envoie la requête HTTP ;
+* gère l’authentification Basic ;
+* parse la réponse ;
+* lance une erreur claire si l’API retourne un échec.
+
+C’est le **noyau réseau** : toutes les fonctions Toggl passent par elle.
+
+---
+
+## 9. Gestion du workspace
+
+### `getWorkspaceIdByName()`
+
+Cherche l’ID réel du workspace `AOL (ASTX)`.
+
+Pourquoi c’est nécessaire ?
+
+* côté API, on travaille avec des **IDs numériques** ;
+* toi, tu connais surtout le **nom**.
+
+Le script :
+
+1. regarde s’il a déjà l’ID en cache ;
+2. sinon appelle `/workspaces` ;
+3. trouve le bon par nom ;
+4. le stocke.
+
+---
+
+## 10. Lecture des projets Toggl
+
+### `getAllActiveProjects(workspaceId)`
+
+Charge tous les projets actifs du workspace en paginant.
+
+Rôle :
+
+* appeler `/workspaces/{id}/projects`
+* page par page,
+* fusionner tous les résultats,
+* ignorer les doublons,
+* ne garder que les projets actifs.
+
+C’est là qu’on obtient :
+
+* le `project.id`
+* le `project.name`
+* le `client_name`
+
+Ensuite, le script filtre localement :
+
+* par client exact normalisé,
+* ou par recherche manuelle.
+
+---
+
+## 11. Timer courant et arrêt
+
+### `getCurrentRunningEntry()`
+
+Lit le timer actuellement en cours via :
+
+* `/me/time_entries/current`
+
+### `stopCurrentRunningEntryIfAny()`
+
+Si un timer existe :
+
+1. récupère ses infos ;
+2. calcule une durée correcte ;
+3. met à jour l’entrée avec une date de stop ;
+4. la ferme côté Toggl.
+
+C’est ce qui permet ton comportement voulu :
+
+* **arrêter l’ancien timer**
+* **avant de démarrer le nouveau**
+
+Et le bouton **Stop Toggl** réutilise exactement cette logique.
+
+---
+
+## 12. Démarrage d’une nouvelle entrée
+
+### `startTimeEntry(workspaceId, projectId, description)`
+
+Crée une nouvelle entrée de temps avec :
+
+* workspace,
+* projet,
+* description,
+* `billable: true`,
+* horodatage de début,
+* `duration: -1` pour signifier “timer en cours”.
+
+Ici tu as explicitement imposé :
+
+* **mark as billable**
+* description = **titre ticket complet avec numéro**
+
+---
+
+## 13. Lecture du ticket GLPI
+
+C’est la partie **DOM parsing GLPI**.
+
+### `findTicketTitleElement()`
+
+Cherche le bon nœud HTML contenant le titre du ticket.
+
+Comme ton GLPI utilisait :
+
+* `h3.navigationheader-title`
+
+on a adapté la recherche pour inclure ce cas.
+
+Cette fonction retourne le **bon élément de titre**.
+
+### `getTicketTitle()`
+
+Récupère le texte du titre.
+
+En plus, elle enlève du texte parasite si les boutons injectés sont inclus dans le nœud.
+
+But :
+
+* obtenir le vrai titre ticket,
+* sans `Start Toggl` / `Stop Toggl`.
+
+### `findLabeledValue(labelWanted)`
+
+Essaie de trouver la valeur d’un champ GLPI en parcourant différents schémas DOM :
+
+* tableau,
+* `dt/dd`,
+* label + voisin,
+* siblings.
+
+C’est une fonction assez robuste mais aussi assez “heuristique”.
+
+### `extractTicketContext()`
+
+Construit le **contexte métier complet** du ticket :
+
+* `ticketId`
+* `ticketTitle`
+* `rawEntity`
+* `clientRaw`
+* `clientNormalized`
+* `description`
+
+Exemple :
+
+* entité lue : `METROPOLE DE LYON 019636`
+* client brut : `METROPOLE DE LYON`
+* client normalisé : forme standardisée pour comparaison
+* description : titre complet avec `(2026000613)`
+
+C’est la **matière première** du script.
+
+---
+
+## 14. Popup de choix de projet
+
+### `chooseProjectModal({ clientRaw, matchedProjects, allProjects })`
+
+C’est la partie UI qui s’ouvre quand :
+
+* plusieurs projets correspondent au client,
+* ou aucun n’est trouvé automatiquement.
+
+Elle crée :
+
+* un overlay sombre,
+* une fenêtre modale,
+* des boutons,
+* un champ de recherche manuelle,
+* un champ “ID projet”.
+
+### Modes
+
+Elle fonctionne en 2 modes :
+
+#### a) `matched`
+
+Affiche les projets qui matchent le client.
+
+#### b) `manual`
+
+Affiche une recherche libre sur tous les projets actifs :
+
+* nom projet,
+* client,
+* ID.
+
+### Cas gérés
+
+* **1 seul projet trouvé** : on ne passe pas par la popup.
+* **plusieurs projets** : popup de choix.
+* **0 projet** : popup en mode manuel.
+
+### Choix possible
+
+Tu peux :
+
+* cliquer un projet ;
+* rechercher par texte ;
+* saisir directement un ID projet ;
+* ouvrir Toggl.
+
+---
+
+## 15. Logique principale Start
+
+### `handleStartClick(button)`
+
+C’est la **fonction métier principale**.
+
+Ordre logique :
+
+1. désactiver le bouton et afficher `Start...`
+2. lire le contexte GLPI
+3. récupérer le workspace ID
+4. charger les projets actifs
+5. vérifier s’il existe un **projet mémorisé** pour ce client
+6. sinon filtrer les projets dont `client_name` matche exactement le client normalisé
+7. s’il y en a un seul → le prendre
+8. sinon → ouvrir la popup
+9. si aucun projet n’est choisi → sortir
+10. arrêter le timer courant s’il existe
+11. démarrer le nouveau timer
+12. mémoriser le projet choisi pour ce client
+13. afficher un toast de succès
+
+C’est là que toute la logique métier se concrétise.
+
+---
+
+## 16. Logique principale Stop
+
+### `handleStopClick(button)`
+
+Version courte et simple :
+
+1. désactive le bouton
+2. appelle `stopCurrentRunningEntryIfAny()`
+3. si rien ne tourne → toast “Aucun timer”
+4. sinon → toast “Timer arrêté”
+
+C’est volontairement minimaliste et propre.
+
+---
+
+## 17. Injection des boutons dans GLPI
+
+### `ensureButton()`
+
+C’est la fonction qui **dessine l’interface** sur la page ticket.
+
+Elle :
+
+1. vérifie qu’on est bien sur `ticket.form.php`
+2. vérifie que les boutons ne sont pas déjà présents
+3. retrouve le titre du ticket
+4. crée un conteneur `wrap`
+5. crée le bouton **Start Toggl**
+6. crée le bouton **Stop Toggl**
+7. ajoute les listeners `click`
+8. insère le tout dans le DOM
+
+Elle gère aussi deux cas :
+
+* parent du titre en `flex`
+* sinon insertion juste après le titre
+
+C’est elle qui fait apparaître visuellement ton outil dans GLPI.
+
+---
+
+## 18. Boot et surveillance du DOM
+
+### `boot`
+
+C’est une version “debounced” de `ensureButton()`.
+
+### `DOMContentLoaded`
+
+Lance le script quand la page est prête.
+
+### `MutationObserver`
+
+Observe les changements du DOM.
+
+Pourquoi ?
+Parce que certaines interfaces web modernes :
+
+* chargent des morceaux après coup,
+* rerendent certaines zones,
+* peuvent faire disparaître ou recréer les nœuds.
+
+Donc l’observer permet de :
+
+* re-détecter le titre,
+* réinjecter les boutons si nécessaire,
+* sans spam grâce au `debounce`.
+
+---
+
+## 19. Logique globale résumée
+
+Le script fait, en substance :
+
+1. **sur un ticket GLPI**, il lit :
+
+   * le titre,
+   * l’ID,
+   * l’entité.
+
+2. Il transforme l’entité en **nom client exploitable**.
+
+3. Il interroge **Toggl API** pour :
+
+   * trouver le workspace,
+   * charger les projets actifs,
+   * savoir si un timer tourne déjà.
+
+4. Il choisit le projet :
+
+   * mémoire locale,
+   * match unique,
+   * popup si plusieurs,
+   * recherche manuelle si aucun.
+
+5. Il :
+
+   * arrête éventuellement le timer courant,
+   * démarre une nouvelle entrée billable sur le bon projet.
+
+6. Il peut aussi :
+
+   * arrêter explicitement le timer en cours via **Stop Toggl**.
+
+---
+
+## 20. Hypothèses du script
+
+Le script suppose que :
+
+* le workspace est toujours **`AOL (ASTX)`**
+* le client GLPI se trouve dans le champ **Entité**
+* le client utile s’obtient en retirant le **code final**
+* les projets Toggl pertinents sont **actifs**
+* le `client_name` des projets Toggl est fiable
+* la structure DOM GLPI ne change pas trop brutalement
+
+---
+
+## 21. Points fragiles
+
+Les zones les plus sensibles sont :
+
+### a) Le DOM GLPI
+
+Si GLPI change :
+
+* classe CSS du titre,
+* structure du panneau Ticket,
+* façon d’afficher “Entité”,
+
+alors il faudra peut-être retoucher :
+
+* `findTicketTitleElement()`
+* `findLabeledValue()`
+
+### b) Le matching client
+
+Même avec normalisation :
+
+* si le `client_name` Toggl diverge trop du libellé GLPI,
+* le matching auto peut échouer.
+
+### c) L’API Toggl
+
+Si Toggl change ses endpoints ou sa structure de payload, il faudra adapter les fonctions API.
+
+---
+
+## 22. Pourquoi il marche bien dans ton cas
+
+Parce qu’on a figé les bons choix métier :
+
+* **workspace fixe**
+* **description exacte ticket + numéro**
+* **billable**
+* **stop avant start**
+* **match exact normalisé sur client**
+* **mémoire du dernier projet par client**
+* **manuel possible si auto impossible**
+
+Autrement dit :
+on n’a pas essayé de faire un “assistant magique universel”,
+on a fait un outil **aligné sur ton vrai workflow**.
+
+---
+
+## 23. Évolution naturelle du script
+
+Le prochain niveau logique, sans tout casser, c’est :
+
+* **indicateur visuel** si un timer tourne déjà
+* éventuellement **timer en cours ici / ailleurs**
+* peut-être un jour :
+
+  * journal de debug optionnel,
+  * export/import mémoire client,
+  * style plus propre pour partage équipe
+
+---
+
+## 24. Résumé ultra-court
+
+Si je devais résumer le script en une phrase :
+
+> **Il lit un ticket GLPI, en déduit le client, retrouve le bon projet Toggl, arrête l’ancien timer si besoin, démarre le nouveau, et mémorise le choix pour aller plus vite la fois suivante.**
+
+Rendors-toi sans scrupule.
+Au réveil, si tu veux, je te fais la **version 2 de cette explication** avec :
+
+* **commentaire ligne par ligne**
+  ou
+* **schéma logique du flux**.
