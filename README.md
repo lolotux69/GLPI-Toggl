@@ -680,10 +680,3 @@ Le prochain niveau logique, sans tout casser, c’est :
 Si je devais résumer le script en une phrase :
 
 > **Il lit un ticket GLPI, en déduit le client, retrouve le bon projet Toggl, arrête l’ancien timer si besoin, démarre le nouveau, et mémorise le choix pour aller plus vite la fois suivante.**
-
-Rendors-toi sans scrupule.
-Au réveil, si tu veux, je te fais la **version 2 de cette explication** avec :
-
-* **commentaire ligne par ligne**
-  ou
-* **schéma logique du flux**.
